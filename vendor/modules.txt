@@ -168,7 +168,7 @@ github.com/gorilla/mux
 github.com/gorilla/websocket
 # github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645
 github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc
-# github.com/json-iterator/go v1.1.10
+# github.com/json-iterator/go v1.1.11
 ## explicit
 github.com/json-iterator/go
 # github.com/kr/text v0.2.0
