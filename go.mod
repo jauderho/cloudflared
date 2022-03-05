@@ -51,7 +51,7 @@ require (
 	golang.org/x/term v0.0.0-20210615171337-6886f2dfbf5b
 	google.golang.org/genproto v0.0.0-20211223182754-3ac035c7e7cb // indirect
 	google.golang.org/grpc v1.43.0 // indirect
-	gopkg.in/coreos/go-oidc.v2 v2.1.0
+	gopkg.in/coreos/go-oidc.v2 v2.2.1
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0
 	gopkg.in/square/go-jose.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0
