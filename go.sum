@@ -1139,5 +1139,5 @@ sigs.k8s.io/structured-merge-diff/v4 v4.1.2/go.mod h1:j/nl6xW8vLS49O8YvXW1ocPhZa
 sigs.k8s.io/yaml v1.2.0/go.mod h1:yfXDCHCao9+ENCvLSE62v9VSji2MKu5jeNfTrofGhJc=
 sourcegraph.com/sourcegraph/go-diff v0.5.0/go.mod h1:kuch7UrkMzY0X+p9CRK03kfuPQ2zzQcaEFbx8wA8rck=
 sourcegraph.com/sqs/pbtypes v0.0.0-20180604144634-d3ebe8f20ae4/go.mod h1:ketZ/q3QxT9HOBeFhu6RdvsftgpsbFHBF5Cas6cDKZ0=
-zombiezen.com/go/capnproto2 v2.18.0+incompatible h1:mwfXZniffG5mXokQGHUJWGnqIBggoPfT/CEwon9Yess=
-zombiezen.com/go/capnproto2 v2.18.0+incompatible/go.mod h1:XO5Pr2SbXgqZwn0m0Ru54QBqpOf4K5AYBO+8LAOBQEQ=
+zombiezen.com/go/capnproto2 v2.18.2+incompatible h1:v3BD1zbruvffn7zjJUU5Pn8nZAB11bhZSQC4W+YnnKo=
+zombiezen.com/go/capnproto2 v2.18.2+incompatible/go.mod h1:XO5Pr2SbXgqZwn0m0Ru54QBqpOf4K5AYBO+8LAOBQEQ=
