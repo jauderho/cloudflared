@@ -11,7 +11,7 @@ require (
 	github.com/fsnotify/fsnotify v1.4.9
 	github.com/gdamore/tcell v1.3.0
 	github.com/getsentry/raven-go v0.0.0-20180517221441-ed7bcb39ff10
-	github.com/gobwas/ws v1.0.4
+	github.com/gobwas/ws v1.1.0
 	github.com/golang-collections/collections v0.0.0-20130729185459-604e922904d3
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/mux v1.8.0
@@ -69,7 +69,7 @@ require (
 	github.com/go-logr/logr v1.2.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-task/slim-sprig v0.0.0-20210107165309-348f09dbbbc0 // indirect
-	github.com/gobwas/httphead v0.0.0-20200921212729-da3d93bc3c58 // indirect
+	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.7.0 // indirect
