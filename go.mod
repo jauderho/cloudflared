@@ -19,7 +19,7 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/lucas-clemente/quic-go v0.24.0
 	github.com/mattn/go-colorable v0.1.8
-	github.com/miekg/dns v1.1.45
+	github.com/miekg/dns v1.1.50
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.12.1
