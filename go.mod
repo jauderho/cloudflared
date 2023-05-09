@@ -38,10 +38,10 @@ require (
 	go.opentelemetry.io/proto/otlp v0.15.0
 	go.uber.org/automaxprocs v1.4.0
 	golang.org/x/crypto v0.8.0
-	golang.org/x/net v0.9.0
+	golang.org/x/net v0.10.0
 	golang.org/x/sync v0.1.0
-	golang.org/x/sys v0.7.0
-	golang.org/x/term v0.7.0
+	golang.org/x/sys v0.8.0
+	golang.org/x/term v0.8.0
 	google.golang.org/protobuf v1.28.1
 	gopkg.in/coreos/go-oidc.v2 v2.2.1
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0
