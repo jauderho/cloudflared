@@ -15,7 +15,7 @@ var (
 	clientConnLabels = []string{"conn_index"}
 	clientMetrics    = struct {
 		totalConnections  prometheus.Counter
-		closedConnections *prometheus.CounterVec
+		closedConnections prometheus.Counter
 		sentPackets       *prometheus.CounterVec
 		sentBytes         *prometheus.CounterVec
 		receivePackets    *prometheus.CounterVec
@@ -30,9 +30,8 @@ var (
 		totalConnections: prometheus.NewCounter(
 			totalConnectionsOpts(logging.PerspectiveClient),
 		),
-		closedConnections: prometheus.NewCounterVec(
+		closedConnections: prometheus.NewCounter(
 			closedConnectionsOpts(logging.PerspectiveClient),
-			[]string{"error"},
 		),
 		sentPackets: prometheus.NewCounterVec(
 			sentPacketsOpts(logging.PerspectiveClient),
@@ -144,6 +143,13 @@ var (
 	}
 	registerClient = sync.Once{}
 	registerServer = sync.Once{}
+
+	packetTooBigDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: perspectiveString(logging.PerspectiveClient),
+		Name:      "packet_too_big_dropped",
+		Help:      "Count of packets received from origin that are too big to send to the edge and are dropped as a result",
+	})
 )
 
 // MetricsCollector abstracts the difference between client and server metrics from connTracer
@@ -264,6 +270,7 @@ func newClientCollector(index uint8) MetricsCollector {
 			clientMetrics.minRTT,
 			clientMetrics.latestRTT,
 			clientMetrics.smoothedRTT,
+			packetTooBigDropped,
 		)
 	})
 	return &clientCollector{
@@ -276,7 +283,7 @@ func (cc *clientCollector) startedConnection() {
 }
 
 func (cc *clientCollector) closedConnection(err error) {
-	clientMetrics.closedConnections.WithLabelValues(err.Error()).Inc()
+	clientMetrics.closedConnections.Inc()
 }
 
 func (cc *clientCollector) sentPackets(size logging.ByteCount) {

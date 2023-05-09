@@ -29,6 +29,10 @@ const (
 	AccessLoginWorkerPath = "/cdn-cgi/access/login"
 )
 
+var (
+	userAgent = "DEV"
+)
+
 type AppInfo struct {
 	AuthDomain string
 	AppAUD     string
@@ -144,6 +148,10 @@ func isTokenLocked(lockFilePath string) bool {
 	return exists && err == nil
 }
 
+func Init(version string) {
+	userAgent = fmt.Sprintf("cloudflared/%s", version)
+}
+
 // FetchTokenWithRedirect will either load a stored token or generate a new one
 // it appends the full url as the redirect URL to the access cli request if opening the browser
 func FetchTokenWithRedirect(appURL *url.URL, appInfo *AppInfo, log *zerolog.Logger) (string, error) {
@@ -206,19 +214,19 @@ func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, log *zerolog.
 			return appToken, nil
 		}
 	}
-	return getTokensFromEdge(appURL, appTokenPath, orgTokenPath, useHostOnly, log)
+	return getTokensFromEdge(appURL, appInfo.AppAUD, appTokenPath, orgTokenPath, useHostOnly, log)
 
 }
 
 // getTokensFromEdge will attempt to use the transfer service to retrieve an app and org token, save them to disk,
 // and return the app token.
-func getTokensFromEdge(appURL *url.URL, appTokenPath, orgTokenPath string, useHostOnly bool, log *zerolog.Logger) (string, error) {
+func getTokensFromEdge(appURL *url.URL, appAUD, appTokenPath, orgTokenPath string, useHostOnly bool, log *zerolog.Logger) (string, error) {
 	// If no org token exists or if it couldn't be exchanged for an app token, then run the transfer service flow.
 
 	// this weird parameter is the resource name (token) and the key/value
 	// we want to send to the transfer service. the key is token and the value
 	// is blank (basically just the id generated in the transfer service)
-	resourceData, err := RunTransfer(appURL, keyName, keyName, "", true, useHostOnly, log)
+	resourceData, err := RunTransfer(appURL, appAUD, keyName, keyName, "", true, useHostOnly, log)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to run transfer service")
 	}
@@ -261,6 +269,7 @@ func GetAppInfo(reqURL *url.URL) (*AppInfo, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create app info request")
 	}
+	appInfoReq.Header.Add("User-Agent", userAgent)
 	resp, err := client.Do(appInfoReq)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get app info")
@@ -311,6 +320,7 @@ func exchangeOrgToken(appURL *url.URL, orgToken string) (string, error) {
 	if err != nil {
 		return "", errors.Wrap(err, "failed to create app token request")
 	}
+	appTokenRequest.Header.Add("User-Agent", userAgent)
 	resp, err := client.Do(appTokenRequest)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to get app token")

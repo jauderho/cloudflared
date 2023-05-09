@@ -6,12 +6,11 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
-	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/stretchr/testify/assert"
 
+	"github.com/cloudflare/cloudflared/stream"
 	"github.com/cloudflare/cloudflared/tracing"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/cloudflare/cloudflared/websocket"
@@ -30,6 +29,8 @@ var (
 	testLargeResp = make([]byte, largeFileSize)
 )
 
+var _ ReadWriteAcker = (*HTTPResponseReadWriteAcker)(nil)
+
 type testRequest struct {
 	name           string
 	endpoint       string
@@ -42,6 +43,10 @@ type mockOrchestrator struct {
 	originProxy OriginProxy
 }
 
+func (mcr *mockOrchestrator) GetConfigJSON() ([]byte, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
 func (*mockOrchestrator) UpdateConfig(version int32, config []byte) *tunnelpogs.UpdateConfigurationResponse {
 	return &tunnelpogs.UpdateConfigurationResponse{
 		LastAppliedVersion: version,
@@ -52,11 +57,15 @@ func (mcr *mockOrchestrator) GetOriginProxy() (OriginProxy, error) {
 	return mcr.originProxy, nil
 }
 
+func (mcr *mockOrchestrator) WarpRoutingEnabled() (enabled bool) {
+	return true
+}
+
 type mockOriginProxy struct{}
 
 func (moc *mockOriginProxy) ProxyHTTP(
 	w ResponseWriter,
-	tr *tracing.TracedRequest,
+	tr *tracing.TracedHTTPRequest,
 	isWebsocket bool,
 ) error {
 	req := tr.Request
@@ -132,7 +141,7 @@ func wsEchoEndpoint(w ResponseWriter, r *http.Request) error {
 	}()
 
 	originConn := &echoPipe{reader: readPipe, writer: writePipe}
-	websocket.Stream(wsConn, originConn, &log)
+	stream.Pipe(wsConn, originConn, &log)
 	cancel()
 	wsConn.Close()
 	return nil
@@ -170,7 +179,7 @@ func wsFlakyEndpoint(w ResponseWriter, r *http.Request) error {
 
 	closedAfter := time.Millisecond * time.Duration(rand.Intn(50))
 	originConn := &flakyConn{closeAt: time.Now().Add(closedAfter)}
-	websocket.Stream(wsConn, originConn, &log)
+	stream.Pipe(wsConn, originConn, &log)
 	cancel()
 	wsConn.Close()
 	return nil
@@ -190,41 +199,4 @@ func (mcf mockConnectedFuse) Connected() {}
 
 func (mcf mockConnectedFuse) IsConnected() bool {
 	return true
-}
-
-func TestIsEventStream(t *testing.T) {
-	tests := []struct {
-		headers       http.Header
-		isEventStream bool
-	}{
-		{
-			headers:       newHeader("Content-Type", "text/event-stream"),
-			isEventStream: true,
-		},
-		{
-			headers:       newHeader("content-type", "text/event-stream"),
-			isEventStream: true,
-		},
-		{
-			headers:       newHeader("Content-Type", "text/event-stream; charset=utf-8"),
-			isEventStream: true,
-		},
-		{
-			headers:       newHeader("Content-Type", "application/json"),
-			isEventStream: false,
-		},
-		{
-			headers:       http.Header{},
-			isEventStream: false,
-		},
-	}
-	for _, test := range tests {
-		assert.Equal(t, test.isEventStream, IsServerSentEvent(test.headers))
-	}
-}
-
-func newHeader(key, value string) http.Header {
-	header := http.Header{}
-	header.Add(key, value)
-	return header
 }

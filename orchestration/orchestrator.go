@@ -27,10 +27,13 @@ type Orchestrator struct {
 	// Used by UpdateConfig to make sure one update at a time
 	lock sync.RWMutex
 	// Underlying value is proxy.Proxy, can be read without the lock, but still needs the lock to update
-	proxy  atomic.Value
-	config *Config
-	tags   []tunnelpogs.Tag
-	log    *zerolog.Logger
+	proxy atomic.Value
+	// Set of local ingress rules defined at cloudflared startup (separate from user-defined ingress rules)
+	localRules         []ingress.Rule
+	warpRoutingEnabled atomic.Bool
+	config             *Config
+	tags               []tunnelpogs.Tag
+	log                *zerolog.Logger
 
 	// orchestrator must not handle any more updates after shutdownC is closed
 	shutdownC <-chan struct{}
@@ -38,23 +41,26 @@ type Orchestrator struct {
 	proxyShutdownC chan<- struct{}
 }
 
-func NewOrchestrator(ctx context.Context, config *Config, tags []tunnelpogs.Tag, log *zerolog.Logger) (*Orchestrator, error) {
+func NewOrchestrator(ctx context.Context, config *Config, tags []tunnelpogs.Tag, localRules []ingress.Rule, log *zerolog.Logger) (*Orchestrator, error) {
 	o := &Orchestrator{
 		// Lowest possible version, any remote configuration will have version higher than this
-		currentVersion: 0,
+		// Starting at -1 allows a configuration migration (local to remote) to override the current configuration as it
+		// will start at version 0.
+		currentVersion: -1,
+		localRules:     localRules,
 		config:         config,
 		tags:           tags,
 		log:            log,
 		shutdownC:      ctx.Done(),
 	}
-	if err := o.updateIngress(*config.Ingress, config.WarpRoutingEnabled); err != nil {
+	if err := o.updateIngress(*config.Ingress, config.WarpRouting); err != nil {
 		return nil, err
 	}
 	go o.waitToCloseLastProxy()
 	return o, nil
 }
 
-// Update creates a new proxy with the new ingress rules
+// UpdateConfig creates a new proxy with the new ingress rules
 func (o *Orchestrator) UpdateConfig(version int32, config []byte) *tunnelpogs.UpdateConfigurationResponse {
 	o.lock.Lock()
 	defer o.lock.Unlock()
@@ -63,12 +69,12 @@ func (o *Orchestrator) UpdateConfig(version int32, config []byte) *tunnelpogs.Up
 		o.log.Debug().
 			Int32("current_version", o.currentVersion).
 			Int32("received_version", version).
-			Msg("Current version is equal or newer than receivied version")
+			Msg("Current version is equal or newer than received version")
 		return &tunnelpogs.UpdateConfigurationResponse{
 			LastAppliedVersion: o.currentVersion,
 		}
 	}
-	var newConf newConfig
+	var newConf newRemoteConfig
 	if err := json.Unmarshal(config, &newConf); err != nil {
 		o.log.Err(err).
 			Int32("version", version).
@@ -80,7 +86,7 @@ func (o *Orchestrator) UpdateConfig(version int32, config []byte) *tunnelpogs.Up
 		}
 	}
 
-	if err := o.updateIngress(newConf.Ingress, newConf.WarpRouting.Enabled); err != nil {
+	if err := o.updateIngress(newConf.Ingress, newConf.WarpRouting); err != nil {
 		o.log.Err(err).
 			Int32("version", version).
 			Str("config", string(config)).
@@ -103,12 +109,15 @@ func (o *Orchestrator) UpdateConfig(version int32, config []byte) *tunnelpogs.Up
 }
 
 // The caller is responsible to make sure there is no concurrent access
-func (o *Orchestrator) updateIngress(ingressRules ingress.Ingress, warpRoutingEnabled bool) error {
+func (o *Orchestrator) updateIngress(ingressRules ingress.Ingress, warpRouting ingress.WarpRoutingConfig) error {
 	select {
 	case <-o.shutdownC:
 		return fmt.Errorf("cloudflared already shutdown")
 	default:
 	}
+
+	// Assign the local ingress rules to the parsed ingress
+	ingressRules.LocalRules = o.localRules
 
 	// Start new proxy before closing the ones from last version.
 	// The upside is we don't need to restart proxy from last version, which can fail
@@ -118,10 +127,15 @@ func (o *Orchestrator) updateIngress(ingressRules ingress.Ingress, warpRoutingEn
 	if err := ingressRules.StartOrigins(o.log, proxyShutdownC); err != nil {
 		return errors.Wrap(err, "failed to start origin")
 	}
-	newProxy := proxy.NewOriginProxy(ingressRules, warpRoutingEnabled, o.tags, o.log)
-	o.proxy.Store(newProxy)
+	proxy := proxy.NewOriginProxy(ingressRules, warpRouting, o.tags, o.log)
+	o.proxy.Store(proxy)
 	o.config.Ingress = &ingressRules
-	o.config.WarpRoutingEnabled = warpRoutingEnabled
+	o.config.WarpRouting = warpRouting
+	if warpRouting.Enabled {
+		o.warpRoutingEnabled.Store(true)
+	} else {
+		o.warpRoutingEnabled.Store(false)
+	}
 
 	// If proxyShutdownC is nil, there is no previous running proxy
 	if o.proxyShutdownC != nil {
@@ -131,8 +145,24 @@ func (o *Orchestrator) updateIngress(ingressRules ingress.Ingress, warpRoutingEn
 	return nil
 }
 
-// GetConfigJSON returns the current version and configuration as JSON
+// GetConfigJSON returns the current json serialization of the config as the edge understands it
 func (o *Orchestrator) GetConfigJSON() ([]byte, error) {
+	o.lock.RLock()
+	defer o.lock.RUnlock()
+
+	c := &newLocalConfig{
+		RemoteConfig: ingress.RemoteConfig{
+			Ingress:     *o.config.Ingress,
+			WarpRouting: o.config.WarpRouting,
+		},
+		ConfigurationFlags: o.config.ConfigurationFlags,
+	}
+
+	return json.Marshal(c)
+}
+
+// GetVersionedConfigJSON returns the current version and configuration as JSON
+func (o *Orchestrator) GetVersionedConfigJSON() ([]byte, error) {
 	o.lock.RLock()
 	defer o.lock.RUnlock()
 	var currentConfiguration = struct {
@@ -150,7 +180,7 @@ func (o *Orchestrator) GetConfigJSON() ([]byte, error) {
 			OriginRequest ingress.OriginRequestConfig `json:"originRequest"`
 		}{
 			Ingress:       o.config.Ingress.Rules,
-			WarpRouting:   config.WarpRoutingConfig{Enabled: o.config.WarpRoutingEnabled},
+			WarpRouting:   o.config.WarpRouting.RawConfig(),
 			OriginRequest: o.config.Ingress.Defaults,
 		},
 	}
@@ -165,13 +195,17 @@ func (o *Orchestrator) GetOriginProxy() (connection.OriginProxy, error) {
 		o.log.Error().Msg(err.Error())
 		return nil, err
 	}
-	proxy, ok := val.(*proxy.Proxy)
+	proxy, ok := val.(connection.OriginProxy)
 	if !ok {
 		err := fmt.Errorf("origin proxy has unexpected value %+v", val)
 		o.log.Error().Msg(err.Error())
 		return nil, err
 	}
 	return proxy, nil
+}
+
+func (o *Orchestrator) WarpRoutingEnabled() bool {
+	return o.warpRoutingEnabled.Load()
 }
 
 func (o *Orchestrator) waitToCloseLastProxy() {

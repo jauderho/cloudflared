@@ -19,47 +19,55 @@ import (
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
+	"github.com/cloudflare/cloudflared/features"
 	"github.com/cloudflare/cloudflared/h2mux"
+	"github.com/cloudflare/cloudflared/ingress"
+	"github.com/cloudflare/cloudflared/management"
 	"github.com/cloudflare/cloudflared/orchestration"
 	quicpogs "github.com/cloudflare/cloudflared/quic"
 	"github.com/cloudflare/cloudflared/retry"
 	"github.com/cloudflare/cloudflared/signal"
 	"github.com/cloudflare/cloudflared/tunnelrpc"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
+	"github.com/cloudflare/cloudflared/tunnelstate"
 )
 
 const (
-	dialTimeout              = 15 * time.Second
-	FeatureSerializedHeaders = "serialized_headers"
-	FeatureQuickReconnects   = "quick_reconnects"
-	FeatureAllowRemoteConfig = "allow_remote_config"
+	dialTimeout = 15 * time.Second
 )
 
 type TunnelConfig struct {
-	GracePeriod     time.Duration
-	ReplaceExisting bool
-	OSArch          string
-	ClientID        string
-	CloseConnOnce   *sync.Once // Used to close connectedSignal no more than once
-	EdgeAddrs       []string
-	Region          string
-	HAConnections   int
-	IncidentLookup  IncidentLookup
-	IsAutoupdated   bool
-	LBPool          string
-	Tags            []tunnelpogs.Tag
-	Log             *zerolog.Logger
-	LogTransport    *zerolog.Logger
-	Observer        *connection.Observer
-	ReportedVersion string
-	Retries         uint
-	RunFromTerminal bool
+	GracePeriod        time.Duration
+	ReplaceExisting    bool
+	OSArch             string
+	ClientID           string
+	CloseConnOnce      *sync.Once // Used to close connectedSignal no more than once
+	EdgeAddrs          []string
+	Region             string
+	EdgeIPVersion      allregions.ConfigIPVersion
+	EdgeBindAddr       net.IP
+	HAConnections      int
+	IncidentLookup     IncidentLookup
+	IsAutoupdated      bool
+	LBPool             string
+	Tags               []tunnelpogs.Tag
+	Log                *zerolog.Logger
+	LogTransport       *zerolog.Logger
+	Observer           *connection.Observer
+	ReportedVersion    string
+	Retries            uint
+	MaxEdgeAddrRetries uint8
+	RunFromTerminal    bool
+
+	NeedPQ bool
+
+	// Index into PQKexes of post-quantum kex to use if NeedPQ is set.
+	PQKexIdx int
 
 	NamedTunnel      *connection.NamedTunnelProperties
-	ClassicTunnel    *connection.ClassicTunnelProperties
-	MuxerConfig      *connection.MuxerConfig
 	ProtocolSelector connection.ProtocolSelector
 	EdgeTLSConfigs   map[connection.Protocol]*tls.Config
+	PacketConfig     *ingress.GlobalRouterConfig
 }
 
 func (c *TunnelConfig) registrationOptions(connectionID uint8, OriginLocalIP string, uuid uuid.UUID) *tunnelpogs.RegistrationOptions {
@@ -78,7 +86,7 @@ func (c *TunnelConfig) registrationOptions(connectionID uint8, OriginLocalIP str
 		OriginLocalIP:        OriginLocalIP,
 		IsAutoupdated:        c.IsAutoupdated,
 		RunFromTerminal:      c.RunFromTerminal,
-		CompressionQuality:   uint64(c.MuxerConfig.CompressionSetting),
+		CompressionQuality:   0,
 		UUID:                 uuid.String(),
 		Features:             c.SupportedFeatures(),
 	}
@@ -93,17 +101,17 @@ func (c *TunnelConfig) connectionOptions(originLocalAddr string, numPreviousAtte
 		Client:              c.NamedTunnel.Client,
 		OriginLocalIP:       originIP,
 		ReplaceExisting:     c.ReplaceExisting,
-		CompressionQuality:  uint8(c.MuxerConfig.CompressionSetting),
+		CompressionQuality:  0,
 		NumPreviousAttempts: numPreviousAttempts,
 	}
 }
 
 func (c *TunnelConfig) SupportedFeatures() []string {
-	features := []string{FeatureSerializedHeaders}
+	supported := []string{features.FeatureSerializedHeaders}
 	if c.NamedTunnel == nil {
-		features = append(features, FeatureQuickReconnects)
+		supported = append(supported, features.FeatureQuickReconnects)
 	}
-	return features
+	return supported
 }
 
 func StartTunnelDaemon(
@@ -121,30 +129,96 @@ func StartTunnelDaemon(
 	return s.Run(ctx, connectedSignal)
 }
 
-func ServeTunnelLoop(
-	ctx context.Context,
-	credentialManager *reconnectCredentialManager,
-	config *TunnelConfig,
-	orchestrator *orchestration.Orchestrator,
-	addr *allregions.EdgeAddr,
-	connAwareLogger *ConnAwareLogger,
-	connIndex uint8,
-	connectedSignal *signal.Signal,
-	cloudflaredUUID uuid.UUID,
-	reconnectCh chan ReconnectSignal,
-	gracefulShutdownC <-chan struct{},
-) error {
+type ConnectivityError struct {
+	reachedMaxRetries bool
+}
+
+func NewConnectivityError(hasReachedMaxRetries bool) *ConnectivityError {
+	return &ConnectivityError{
+		reachedMaxRetries: hasReachedMaxRetries,
+	}
+}
+
+func (e *ConnectivityError) Error() string {
+	return fmt.Sprintf("connectivity error - reached max retries: %t", e.HasReachedMaxRetries())
+}
+
+func (e *ConnectivityError) HasReachedMaxRetries() bool {
+	return e.reachedMaxRetries
+}
+
+// EdgeAddrHandler provides a mechanism switch between behaviors in ServeTunnel
+// for handling the errors when attempting to make edge connections.
+type EdgeAddrHandler interface {
+	// ShouldGetNewAddress will check the edge connection error and determine if
+	// the edge address should be replaced with a new one. Also, will return if the
+	// error should be recognized as a connectivity error, or otherwise, a general
+	// application error.
+	ShouldGetNewAddress(connIndex uint8, err error) (needsNewAddress bool, connectivityError error)
+}
+
+func NewIPAddrFallback(maxRetries uint8) *ipAddrFallback {
+	return &ipAddrFallback{
+		retriesByConnIndex: make(map[uint8]uint8),
+		maxRetries:         maxRetries,
+	}
+}
+
+// ipAddrFallback will have more conditions to fall back to a new address for certain
+// edge connection errors. This means that this handler will return true for isConnectivityError
+// for more cases like duplicate connection register and edge quic dial errors.
+type ipAddrFallback struct {
+	m                  sync.Mutex
+	retriesByConnIndex map[uint8]uint8
+	maxRetries         uint8
+}
+
+func (f *ipAddrFallback) ShouldGetNewAddress(connIndex uint8, err error) (needsNewAddress bool, connectivityError error) {
+	f.m.Lock()
+	defer f.m.Unlock()
+	switch err.(type) {
+	case nil: // maintain current IP address
+	// Try the next address if it was a quic.IdleTimeoutError
+	// DupConnRegisterTunnelError needs to also receive a new ip address
+	case connection.DupConnRegisterTunnelError,
+		*quic.IdleTimeoutError:
+		return true, nil
+	// Network problems should be retried with new address immediately and report
+	// as connectivity error
+	case edgediscovery.DialError, *connection.EdgeQuicDialError:
+		if f.retriesByConnIndex[connIndex] >= f.maxRetries {
+			f.retriesByConnIndex[connIndex] = 0
+			return true, NewConnectivityError(true)
+		}
+		f.retriesByConnIndex[connIndex]++
+		return true, NewConnectivityError(false)
+	default: // maintain current IP address
+	}
+	return false, nil
+}
+
+type EdgeTunnelServer struct {
+	config            *TunnelConfig
+	orchestrator      *orchestration.Orchestrator
+	credentialManager *reconnectCredentialManager
+	edgeAddrHandler   EdgeAddrHandler
+	edgeAddrs         *edgediscovery.Edge
+	edgeBindAddr      net.IP
+	reconnectCh       chan ReconnectSignal
+	gracefulShutdownC <-chan struct{}
+	tracker           *tunnelstate.ConnTracker
+
+	connAwareLogger *ConnAwareLogger
+}
+
+type TunnelServer interface {
+	Serve(ctx context.Context, connIndex uint8, protocolFallback *protocolFallback, connectedSignal *signal.Signal) error
+}
+
+func (e *EdgeTunnelServer) Serve(ctx context.Context, connIndex uint8, protocolFallback *protocolFallback, connectedSignal *signal.Signal) error {
 	haConnections.Inc()
 	defer haConnections.Dec()
 
-	logger := config.Log.With().Uint8(connection.LogFieldConnIndex, connIndex).Logger()
-	connLog := connAwareLogger.ReplaceLogger(&logger)
-
-	protocolFallback := &protocolFallback{
-		retry.BackoffHandler{MaxRetries: config.Retries},
-		config.ProtocolSelector.Current(),
-		false,
-	}
 	connectedFuse := h2mux.NewBooleanFuse()
 	go func() {
 		if connectedFuse.Await() {
@@ -153,54 +227,91 @@ func ServeTunnelLoop(
 	}()
 	// Ensure the above goroutine will terminate if we return without connecting
 	defer connectedFuse.Fuse(false)
+
+	// Fetch IP address to associated connection index
+	addr, err := e.edgeAddrs.GetAddr(int(connIndex))
+	switch err.(type) {
+	case nil: // no error
+	case edgediscovery.ErrNoAddressesLeft:
+		return err
+	default:
+		return err
+	}
+
+	logger := e.config.Log.With().
+		Int(management.EventTypeKey, int(management.Cloudflared)).
+		IPAddr(connection.LogFieldIPAddress, addr.UDP.IP).
+		Uint8(connection.LogFieldConnIndex, connIndex).
+		Logger()
+	connLog := e.connAwareLogger.ReplaceLogger(&logger)
+
 	// Each connection to keep its own copy of protocol, because individual connections might fallback
 	// to another protocol when a particular metal doesn't support new protocol
-	for {
-		err, recoverable := ServeTunnel(
-			ctx,
-			connLog,
-			credentialManager,
-			config,
-			orchestrator,
-			addr,
-			connIndex,
-			connectedFuse,
-			protocolFallback,
-			cloudflaredUUID,
-			reconnectCh,
-			protocolFallback.protocol,
-			gracefulShutdownC,
-		)
+	// Each connection can also have it's own IP version because individual connections might fallback
+	// to another IP version.
+	err, shouldFallbackProtocol := e.serveTunnel(
+		ctx,
+		connLog,
+		addr,
+		connIndex,
+		connectedFuse,
+		protocolFallback,
+		protocolFallback.protocol,
+	)
 
-		if recoverable {
-			duration, ok := protocolFallback.GetMaxBackoffDuration(ctx)
-			if !ok {
-				return err
-			}
-			config.Observer.SendReconnect(connIndex)
-			connLog.Logger().Info().Msgf("Retrying connection in up to %s seconds", duration)
+	// Check if the connection error was from an IP issue with the host or
+	// establishing a connection to the edge and if so, rotate the IP address.
+	shouldRotateEdgeIP, cErr := e.edgeAddrHandler.ShouldGetNewAddress(connIndex, err)
+	if shouldRotateEdgeIP {
+		// rotate IP, but forcing internal state to assign a new IP to connection index.
+		if _, err := e.edgeAddrs.GetDifferentAddr(int(connIndex), true); err != nil {
+			return err
 		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-gracefulShutdownC:
-			return nil
-		case <-protocolFallback.BackoffTimer():
-			if !recoverable {
-				return err
-			}
-
-			if !selectNextProtocol(
-				connLog.Logger(),
-				protocolFallback,
-				config.ProtocolSelector,
-				err,
-			) {
-				return err
-			}
+		// In addition, if it is a connectivity error, and we have exhausted the configurable maximum edge IPs to rotate,
+		// then just fallback protocol on next iteration run.
+		connectivityErr, ok := cErr.(*ConnectivityError)
+		if ok {
+			shouldFallbackProtocol = connectivityErr.HasReachedMaxRetries()
 		}
 	}
+
+	// set connection has re-connecting and log the next retrying backoff
+	duration, ok := protocolFallback.GetMaxBackoffDuration(ctx)
+	if !ok {
+		return err
+	}
+	e.config.Observer.SendReconnect(connIndex)
+	connLog.Logger().Info().Msgf("Retrying connection in up to %s", duration)
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.gracefulShutdownC:
+		return nil
+	case <-protocolFallback.BackoffTimer():
+		// should we fallback protocol? If not, just return. Otherwise, set new protocol for next method call.
+		if !shouldFallbackProtocol {
+			return err
+		}
+
+		// If a single connection has connected with the current protocol, we know we know we don't have to fallback
+		// to a different protocol.
+		if e.tracker.HasConnectedWith(e.config.ProtocolSelector.Current()) {
+			return err
+		}
+
+		if !selectNextProtocol(
+			connLog.Logger(),
+			protocolFallback,
+			e.config.ProtocolSelector,
+			err,
+		) {
+			return err
+		}
+	}
+
+	return err
 }
 
 // protocolFallback is a wrapper around backoffHandler that will try fallback option when backoff reaches
@@ -230,17 +341,16 @@ func selectNextProtocol(
 	selector connection.ProtocolSelector,
 	cause error,
 ) bool {
-	var idleTimeoutError *quic.IdleTimeoutError
-	isNetworkActivityTimeout := errors.As(cause, &idleTimeoutError)
+	isQuicBroken := isQuicBroken(cause)
 	_, hasFallback := selector.Fallback()
 
-	if protocolBackoff.ReachedMaxRetries() || (hasFallback && isNetworkActivityTimeout) {
-		if isNetworkActivityTimeout {
+	if protocolBackoff.ReachedMaxRetries() || (hasFallback && isQuicBroken) {
+		if isQuicBroken {
 			connLog.Warn().Msg("If this log occurs persistently, and cloudflared is unable to connect to " +
 				"Cloudflare Network with `quic` protocol, then most likely your machine/network is getting its egress " +
 				"UDP to port 7844 (or others) blocked or dropped. Make sure to allow egress connectivity as per " +
 				"https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/ports-and-ips/\n" +
-				"If you are using private routing to this Tunnel, then UDP (and Private DNS Resolution) will not work" +
+				"If you are using private routing to this Tunnel, then UDP (and Private DNS Resolution) will not work " +
 				"unless your cloudflared can connect with Cloudflare Network with `quic`.")
 		}
 
@@ -264,22 +374,30 @@ func selectNextProtocol(
 	return true
 }
 
+func isQuicBroken(cause error) bool {
+	var idleTimeoutError *quic.IdleTimeoutError
+	if errors.As(cause, &idleTimeoutError) {
+		return true
+	}
+
+	var transportError *quic.TransportError
+	if errors.As(cause, &transportError) && strings.Contains(cause.Error(), "operation not permitted") {
+		return true
+	}
+
+	return false
+}
+
 // ServeTunnel runs a single tunnel connection, returns nil on graceful shutdown,
 // on error returns a flag indicating if error can be retried
-func ServeTunnel(
+func (e *EdgeTunnelServer) serveTunnel(
 	ctx context.Context,
 	connLog *ConnAwareLogger,
-	credentialManager *reconnectCredentialManager,
-	config *TunnelConfig,
-	orchestrator *orchestration.Orchestrator,
 	addr *allregions.EdgeAddr,
 	connIndex uint8,
 	fuse *h2mux.BooleanFuse,
 	backoff *protocolFallback,
-	cloudflaredUUID uuid.UUID,
-	reconnectCh chan ReconnectSignal,
 	protocol connection.Protocol,
-	gracefulShutdownC <-chan struct{},
 ) (err error, recoverable bool) {
 	// Treat panics as recoverable errors
 	defer func() {
@@ -294,21 +412,15 @@ func ServeTunnel(
 		}
 	}()
 
-	defer config.Observer.SendDisconnect(connIndex)
-	err, recoverable = serveTunnel(
+	defer e.config.Observer.SendDisconnect(connIndex)
+	err, recoverable = e.serveConnection(
 		ctx,
 		connLog,
-		credentialManager,
-		config,
-		orchestrator,
 		addr,
 		connIndex,
 		fuse,
 		backoff,
-		cloudflaredUUID,
-		reconnectCh,
 		protocol,
-		gracefulShutdownC,
 	)
 
 	if err != nil {
@@ -321,12 +433,15 @@ func ServeTunnel(
 			connLog.ConnAwareLogger().Err(err).Msg("Register tunnel error from server side")
 			// Don't send registration error return from server to Sentry. They are
 			// logged on server side
-			if incidents := config.IncidentLookup.ActiveIncidents(); len(incidents) > 0 {
+			if incidents := e.config.IncidentLookup.ActiveIncidents(); len(incidents) > 0 {
 				connLog.ConnAwareLogger().Msg(activeIncidentsMsg(incidents))
 			}
 			return err.Cause, !err.Permanent
+		case *connection.EdgeQuicDialError:
+			return err, false
 		case ReconnectSignal:
 			connLog.Logger().Info().
+				IPAddr(connection.LogFieldIPAddress, addr.UDP.IP).
 				Uint8(connection.LogFieldConnIndex, connIndex).
 				Msgf("Restarting connection due to reconnect signal in %s", err.Delay)
 			err.DelayBeforeReconnect()
@@ -344,94 +459,62 @@ func ServeTunnel(
 	return nil, false
 }
 
-func serveTunnel(
+func (e *EdgeTunnelServer) serveConnection(
 	ctx context.Context,
 	connLog *ConnAwareLogger,
-	credentialManager *reconnectCredentialManager,
-	config *TunnelConfig,
-	orchestrator *orchestration.Orchestrator,
 	addr *allregions.EdgeAddr,
 	connIndex uint8,
 	fuse *h2mux.BooleanFuse,
 	backoff *protocolFallback,
-	cloudflaredUUID uuid.UUID,
-	reconnectCh chan ReconnectSignal,
 	protocol connection.Protocol,
-	gracefulShutdownC <-chan struct{},
 ) (err error, recoverable bool) {
 	connectedFuse := &connectedFuse{
 		fuse:    fuse,
 		backoff: backoff,
 	}
 	controlStream := connection.NewControlStream(
-		config.Observer,
+		e.config.Observer,
 		connectedFuse,
-		config.NamedTunnel,
+		e.config.NamedTunnel,
 		connIndex,
+		addr.UDP.IP,
 		nil,
-		gracefulShutdownC,
-		config.GracePeriod,
+		e.gracefulShutdownC,
+		e.config.GracePeriod,
+		protocol,
 	)
 
 	switch protocol {
-	case connection.QUIC, connection.QUICWarp:
-		connOptions := config.connectionOptions(addr.UDP.String(), uint8(backoff.Retries()))
-		return ServeQUIC(ctx,
+	case connection.QUIC:
+		connOptions := e.config.connectionOptions(addr.UDP.String(), uint8(backoff.Retries()))
+		return e.serveQUIC(ctx,
 			addr.UDP,
-			config,
-			orchestrator,
 			connLog,
 			connOptions,
 			controlStream,
-			connIndex,
-			reconnectCh,
-			gracefulShutdownC)
+			connIndex)
 
-	case connection.HTTP2, connection.HTTP2Warp:
-		edgeConn, err := edgediscovery.DialEdge(ctx, dialTimeout, config.EdgeTLSConfigs[protocol], addr.TCP)
+	case connection.HTTP2:
+		edgeConn, err := edgediscovery.DialEdge(ctx, dialTimeout, e.config.EdgeTLSConfigs[protocol], addr.TCP, e.edgeBindAddr)
 		if err != nil {
 			connLog.ConnAwareLogger().Err(err).Msg("Unable to establish connection with Cloudflare edge")
 			return err, true
 		}
 
-		connOptions := config.connectionOptions(edgeConn.LocalAddr().String(), uint8(backoff.Retries()))
-		if err := ServeHTTP2(
+		connOptions := e.config.connectionOptions(edgeConn.LocalAddr().String(), uint8(backoff.Retries()))
+		if err := e.serveHTTP2(
 			ctx,
 			connLog,
-			config,
-			orchestrator,
 			edgeConn,
 			connOptions,
 			controlStream,
 			connIndex,
-			gracefulShutdownC,
-			reconnectCh,
 		); err != nil {
 			return err, false
 		}
 
 	default:
-		edgeConn, err := edgediscovery.DialEdge(ctx, dialTimeout, config.EdgeTLSConfigs[protocol], addr.TCP)
-		if err != nil {
-			connLog.ConnAwareLogger().Err(err).Msg("Unable to establish connection with Cloudflare edge")
-			return err, true
-		}
-
-		if err := ServeH2mux(
-			ctx,
-			connLog,
-			credentialManager,
-			config,
-			orchestrator,
-			edgeConn,
-			connIndex,
-			connectedFuse,
-			cloudflaredUUID,
-			reconnectCh,
-			gracefulShutdownC,
-		); err != nil {
-			return err, false
-		}
+		return fmt.Errorf("invalid protocol selected: %s", protocol), false
 	}
 	return
 }
@@ -444,76 +527,27 @@ func (r unrecoverableError) Error() string {
 	return r.err.Error()
 }
 
-func ServeH2mux(
+func (e *EdgeTunnelServer) serveHTTP2(
 	ctx context.Context,
 	connLog *ConnAwareLogger,
-	credentialManager *reconnectCredentialManager,
-	config *TunnelConfig,
-	orchestrator *orchestration.Orchestrator,
-	edgeConn net.Conn,
-	connIndex uint8,
-	connectedFuse *connectedFuse,
-	cloudflaredUUID uuid.UUID,
-	reconnectCh chan ReconnectSignal,
-	gracefulShutdownC <-chan struct{},
-) error {
-	connLog.Logger().Debug().Msgf("Connecting via h2mux")
-	// Returns error from parsing the origin URL or handshake errors
-	handler, err, recoverable := connection.NewH2muxConnection(
-		orchestrator,
-		config.GracePeriod,
-		config.MuxerConfig,
-		edgeConn,
-		connIndex,
-		config.Observer,
-		gracefulShutdownC,
-	)
-	if err != nil {
-		if !recoverable {
-			return unrecoverableError{err}
-		}
-		return err
-	}
-
-	errGroup, serveCtx := errgroup.WithContext(ctx)
-
-	errGroup.Go(func() error {
-		if config.NamedTunnel != nil {
-			connOptions := config.connectionOptions(edgeConn.LocalAddr().String(), uint8(connectedFuse.backoff.Retries()))
-			return handler.ServeNamedTunnel(serveCtx, config.NamedTunnel, connOptions, connectedFuse)
-		}
-		registrationOptions := config.registrationOptions(connIndex, edgeConn.LocalAddr().String(), cloudflaredUUID)
-		return handler.ServeClassicTunnel(serveCtx, config.ClassicTunnel, credentialManager, registrationOptions, connectedFuse)
-	})
-
-	errGroup.Go(func() error {
-		return listenReconnect(serveCtx, reconnectCh, gracefulShutdownC)
-	})
-
-	return errGroup.Wait()
-}
-
-func ServeHTTP2(
-	ctx context.Context,
-	connLog *ConnAwareLogger,
-	config *TunnelConfig,
-	orchestrator *orchestration.Orchestrator,
 	tlsServerConn net.Conn,
 	connOptions *tunnelpogs.ConnectionOptions,
 	controlStreamHandler connection.ControlStreamHandler,
 	connIndex uint8,
-	gracefulShutdownC <-chan struct{},
-	reconnectCh chan ReconnectSignal,
 ) error {
+	if e.config.NeedPQ {
+		return unrecoverableError{errors.New("HTTP/2 transport does not support post-quantum")}
+	}
+
 	connLog.Logger().Debug().Msgf("Connecting via http2")
 	h2conn := connection.NewHTTP2Connection(
 		tlsServerConn,
-		orchestrator,
+		e.orchestrator,
 		connOptions,
-		config.Observer,
+		e.config.Observer,
 		connIndex,
 		controlStreamHandler,
-		config.Log,
+		e.config.Log,
 	)
 
 	errGroup, serveCtx := errgroup.WithContext(ctx)
@@ -522,10 +556,11 @@ func ServeHTTP2(
 	})
 
 	errGroup.Go(func() error {
-		err := listenReconnect(serveCtx, reconnectCh, gracefulShutdownC)
+		err := listenReconnect(serveCtx, e.reconnectCh, e.gracefulShutdownC)
 		if err != nil {
 			// forcefully break the connection (this is only used for testing)
-			_ = tlsServerConn.Close()
+			// errgroup will return context canceled for the h2conn.Serve
+			connLog.Logger().Debug().Msg("Forcefully breaking http2 connection")
 		}
 		return err
 	})
@@ -533,25 +568,37 @@ func ServeHTTP2(
 	return errGroup.Wait()
 }
 
-func ServeQUIC(
+func (e *EdgeTunnelServer) serveQUIC(
 	ctx context.Context,
 	edgeAddr *net.UDPAddr,
-	config *TunnelConfig,
-	orchestrator *orchestration.Orchestrator,
 	connLogger *ConnAwareLogger,
 	connOptions *tunnelpogs.ConnectionOptions,
 	controlStreamHandler connection.ControlStreamHandler,
 	connIndex uint8,
-	reconnectCh chan ReconnectSignal,
-	gracefulShutdownC <-chan struct{},
 ) (err error, recoverable bool) {
-	tlsConfig := config.EdgeTLSConfigs[connection.QUIC]
+	tlsConfig := e.config.EdgeTLSConfigs[connection.QUIC]
+
+	if e.config.NeedPQ {
+		// If the user passes the -post-quantum flag, we override
+		// CurvePreferences to only support hybrid post-quantum key agreements.
+		cs := make([]tls.CurveID, len(PQKexes))
+		copy(cs, PQKexes[:])
+
+		// It is unclear whether Kyber512 or Kyber768 will become the standard.
+		// Kyber768 is a bit bigger (and doesn't fit in one initial
+		// datagram anymore). We're enabling both, but pick randomly which
+		// one to put first. (TLS will use the first one in the list
+		// and allows a fallback to the second.)
+		cs[0], cs[e.config.PQKexIdx] = cs[e.config.PQKexIdx], cs[0]
+		tlsConfig.CurvePreferences = cs
+	}
+
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout:  quicpogs.HandshakeIdleTimeout,
 		MaxIdleTimeout:        quicpogs.MaxIdleTimeout,
+		KeepAlivePeriod:       quicpogs.MaxIdlePingPeriod,
 		MaxIncomingStreams:    connection.MaxConcurrentStreams,
 		MaxIncomingUniStreams: connection.MaxConcurrentStreams,
-		KeepAlive:             true,
 		EnableDatagrams:       true,
 		MaxDatagramFrameSize:  quicpogs.MaxDatagramFrameSize,
 		Tracer:                quicpogs.NewClientTracer(connLogger.Logger(), connIndex),
@@ -560,12 +607,19 @@ func ServeQUIC(
 	quicConn, err := connection.NewQUICConnection(
 		quicConfig,
 		edgeAddr,
+		e.edgeBindAddr,
+		connIndex,
 		tlsConfig,
-		orchestrator,
+		e.orchestrator,
 		connOptions,
 		controlStreamHandler,
-		connLogger.Logger())
+		connLogger.Logger(),
+		e.config.PacketConfig)
 	if err != nil {
+		if e.config.NeedPQ {
+			handlePQTunnelError(err, e.config)
+		}
+
 		connLogger.ConnAwareLogger().Err(err).Msgf("Failed to create new quic connection")
 		return err, true
 	}
@@ -580,10 +634,11 @@ func ServeQUIC(
 	})
 
 	errGroup.Go(func() error {
-		err := listenReconnect(serveCtx, reconnectCh, gracefulShutdownC)
+		err := listenReconnect(serveCtx, e.reconnectCh, e.gracefulShutdownC)
 		if err != nil {
 			// forcefully break the connection (this is only used for testing)
-			quicConn.Close()
+			// errgroup will return context canceled for the quicConn.Serve
+			connLogger.Logger().Debug().Msg("Forcefully breaking quic connection")
 		}
 		return err
 	})

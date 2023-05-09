@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,13 +25,22 @@ const (
 	LogFieldConnIndex      = "connIndex"
 	MaxGracePeriod         = time.Minute * 3
 	MaxConcurrentStreams   = math.MaxUint32
+
+	contentTypeHeader = "content-type"
+	sseContentType    = "text/event-stream"
+	grpcContentType   = "application/grpc"
 )
 
-var switchingProtocolText = fmt.Sprintf("%d %s", http.StatusSwitchingProtocols, http.StatusText(http.StatusSwitchingProtocols))
+var (
+	switchingProtocolText = fmt.Sprintf("%d %s", http.StatusSwitchingProtocols, http.StatusText(http.StatusSwitchingProtocols))
+	flushableContentTypes = []string{sseContentType, grpcContentType}
+)
 
 type Orchestrator interface {
 	UpdateConfig(version int32, config []byte) *pogs.UpdateConfigurationResponse
+	GetConfigJSON() ([]byte, error)
 	GetOriginProxy() (OriginProxy, error)
+	WarpRoutingEnabled() (enabled bool)
 }
 
 type NamedTunnelProperties struct {
@@ -122,22 +132,25 @@ func (t Type) String() string {
 
 // OriginProxy is how data flows from cloudflared to the origin services running behind it.
 type OriginProxy interface {
-	ProxyHTTP(w ResponseWriter, tr *tracing.TracedRequest, isWebsocket bool) error
+	ProxyHTTP(w ResponseWriter, tr *tracing.TracedHTTPRequest, isWebsocket bool) error
 	ProxyTCP(ctx context.Context, rwa ReadWriteAcker, req *TCPRequest) error
 }
 
 // TCPRequest defines the input format needed to perform a TCP proxy.
 type TCPRequest struct {
-	Dest    string
-	CFRay   string
-	LBProbe bool
+	Dest      string
+	CFRay     string
+	LBProbe   bool
+	FlowID    string
+	CfTraceID string
+	ConnIndex uint8
 }
 
 // ReadWriteAcker is a readwriter with the ability to Acknowledge to the downstream (edge) that the origin has
 // accepted the connection.
 type ReadWriteAcker interface {
 	io.ReadWriter
-	AckConnection() error
+	AckConnection(tracePropagation string) error
 }
 
 // HTTPResponseReadWriteAcker is an HTTP implementation of ReadWriteAcker.
@@ -166,22 +179,74 @@ func (h *HTTPResponseReadWriteAcker) Write(p []byte) (int, error) {
 
 // AckConnection acks an HTTP connection by sending a switch protocols status code that enables the caller to
 // upgrade to streams.
-func (h *HTTPResponseReadWriteAcker) AckConnection() error {
+func (h *HTTPResponseReadWriteAcker) AckConnection(tracePropagation string) error {
 	resp := &http.Response{
 		Status:        switchingProtocolText,
 		StatusCode:    http.StatusSwitchingProtocols,
 		ContentLength: -1,
+		Header:        http.Header{},
 	}
 
 	if secWebsocketKey := h.req.Header.Get("Sec-WebSocket-Key"); secWebsocketKey != "" {
 		resp.Header = websocket.NewResponseHeader(h.req)
 	}
 
+	if tracePropagation != "" {
+		resp.Header.Add(tracing.CanonicalCloudflaredTracingHeader, tracePropagation)
+	}
+
 	return h.w.WriteRespHeaders(resp.StatusCode, resp.Header)
 }
 
+// localProxyConnection emulates an incoming connection to cloudflared as a net.Conn.
+// Used when handling a "hijacked" connection from connection.ResponseWriter
+type localProxyConnection struct {
+	io.ReadWriteCloser
+}
+
+func (c *localProxyConnection) Read(b []byte) (int, error) {
+	return c.ReadWriteCloser.Read(b)
+}
+
+func (c *localProxyConnection) Write(b []byte) (int, error) {
+	return c.ReadWriteCloser.Write(b)
+}
+
+func (c *localProxyConnection) Close() error {
+	return c.ReadWriteCloser.Close()
+}
+
+func (c *localProxyConnection) LocalAddr() net.Addr {
+	// Unused LocalAddr
+	return &net.TCPAddr{IP: net.IPv6loopback, Port: 0, Zone: ""}
+}
+
+func (c *localProxyConnection) RemoteAddr() net.Addr {
+	// Unused RemoteAddr
+	return &net.TCPAddr{IP: net.IPv6loopback, Port: 0, Zone: ""}
+}
+
+func (c *localProxyConnection) SetDeadline(t time.Time) error {
+	// ignored since we can't set the read/write Deadlines for the tunnel back to origintunneld
+	return nil
+}
+
+func (c *localProxyConnection) SetReadDeadline(t time.Time) error {
+	// ignored since we can't set the read/write Deadlines for the tunnel back to origintunneld
+	return nil
+}
+
+func (c *localProxyConnection) SetWriteDeadline(t time.Time) error {
+	// ignored since we can't set the read/write Deadlines for the tunnel back to origintunneld
+	return nil
+}
+
+// ResponseWriter is the response path for a request back through cloudflared's tunnel.
 type ResponseWriter interface {
 	WriteRespHeaders(status int, header http.Header) error
+	AddTrailer(trailerName, trailerValue string)
+	http.ResponseWriter
+	http.Hijacker
 	io.Writer
 }
 
@@ -190,10 +255,18 @@ type ConnectedFuse interface {
 	IsConnected() bool
 }
 
-func IsServerSentEvent(headers http.Header) bool {
-	if contentType := headers.Get("content-type"); contentType != "" {
-		return strings.HasPrefix(strings.ToLower(contentType), "text/event-stream")
+// Helper method to let the caller know what content-types should require a flush on every
+// write to a ResponseWriter.
+func shouldFlush(headers http.Header) bool {
+	if contentType := headers.Get(contentTypeHeader); contentType != "" {
+		contentType = strings.ToLower(contentType)
+		for _, c := range flushableContentTypes {
+			if strings.HasPrefix(contentType, c) {
+				return true
+			}
+		}
 	}
+
 	return false
 }
 

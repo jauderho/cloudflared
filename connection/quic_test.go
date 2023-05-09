@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,16 +25,20 @@ import (
 	"github.com/cloudflare/cloudflared/datagramsession"
 	quicpogs "github.com/cloudflare/cloudflared/quic"
 	"github.com/cloudflare/cloudflared/tracing"
+	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
 var (
 	testTLSServerConfig = quicpogs.GenerateTLSConfig()
 	testQUICConfig      = &quic.Config{
-		KeepAlive:       true,
-		EnableDatagrams: true,
+		ConnectionIDLength: 16,
+		KeepAlivePeriod:    5 * time.Second,
+		EnableDatagrams:    true,
 	}
 )
+
+var _ ReadWriteAcker = (*streamReadWriteAcker)(nil)
 
 // TestQUICServer tests if a quic server accepts and responds to a quic client with the acceptance protocol.
 // It also serves as a demonstration for communication with the QUIC connection started by a cloudflared.
@@ -137,24 +141,33 @@ func TestQUICServer(t *testing.T) {
 		},
 	}
 
-	for _, test := range tests {
+	for i, test := range tests {
+		test := test // capture range variable
 		t.Run(test.desc, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
-			var wg sync.WaitGroup
-			wg.Add(1)
+
+			quicListener, err := quic.Listen(udpListener, testTLSServerConfig, testQUICConfig)
+			require.NoError(t, err)
+
+			serverDone := make(chan struct{})
 			go func() {
-				defer wg.Done()
 				quicServer(
-					t, udpListener, testTLSServerConfig, testQUICConfig,
-					test.dest, test.connectionType, test.metadata, test.message, test.expectedResponse,
+					ctx, t, quicListener, test.dest, test.connectionType, test.metadata, test.message, test.expectedResponse,
 				)
+				close(serverDone)
 			}()
 
-			qc := testQUICConnection(udpListener.LocalAddr(), t)
-			go qc.Serve(ctx)
+			qc := testQUICConnection(udpListener.LocalAddr(), t, uint8(i))
 
-			wg.Wait()
+			connDone := make(chan struct{})
+			go func() {
+				qc.Serve(ctx)
+				close(connDone)
+			}()
+
+			<-serverDone
 			cancel()
+			<-connDone
 		})
 	}
 }
@@ -163,7 +176,7 @@ type fakeControlStream struct {
 	ControlStreamHandler
 }
 
-func (fakeControlStream) ServeControlStream(ctx context.Context, rw io.ReadWriteCloser, connOptions *tunnelpogs.ConnectionOptions) error {
+func (fakeControlStream) ServeControlStream(ctx context.Context, rw io.ReadWriteCloser, connOptions *tunnelpogs.ConnectionOptions, tunnelConfigGetter TunnelConfigJSONGetter) error {
 	<-ctx.Done()
 	return nil
 }
@@ -172,23 +185,16 @@ func (fakeControlStream) IsStopped() bool {
 }
 
 func quicServer(
+	ctx context.Context,
 	t *testing.T,
-	conn net.PacketConn,
-	tlsConf *tls.Config,
-	config *quic.Config,
+	listener quic.Listener,
 	dest string,
 	connectionType quicpogs.ConnectionType,
 	metadata []quicpogs.Metadata,
 	message []byte,
 	expectedResponse []byte,
 ) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	earlyListener, err := quic.Listen(conn, tlsConf, config)
-	require.NoError(t, err)
-
-	session, err := earlyListener.Accept(ctx)
+	session, err := listener.Accept(ctx)
 	require.NoError(t, err)
 
 	quicStream, err := session.OpenStreamSync(context.Background())
@@ -220,7 +226,7 @@ func quicServer(
 
 type mockOriginProxyWithRequest struct{}
 
-func (moc *mockOriginProxyWithRequest) ProxyHTTP(w ResponseWriter, tr *tracing.TracedRequest, isWebsocket bool) error {
+func (moc *mockOriginProxyWithRequest) ProxyHTTP(w ResponseWriter, tr *tracing.TracedHTTPRequest, isWebsocket bool) error {
 	// These are a series of crude tests to ensure the headers and http related data is transferred from
 	// metadata.
 	r := tr.Request
@@ -475,9 +481,11 @@ func TestBuildHTTPRequest(t *testing.T) {
 		},
 	}
 
+	log := zerolog.Nop()
 	for _, test := range tests {
+		test := test // capture range variable
 		t.Run(test.name, func(t *testing.T) {
-			req, err := buildHTTPRequest(test.connectRequest, test.body)
+			req, err := buildHTTPRequest(context.Background(), test.connectRequest, test.body, 0, &log)
 			assert.NoError(t, err)
 			test.req = test.req.WithContext(req.Context())
 			assert.Equal(t, test.req, req.Request)
@@ -486,7 +494,7 @@ func TestBuildHTTPRequest(t *testing.T) {
 }
 
 func (moc *mockOriginProxyWithRequest) ProxyTCP(ctx context.Context, rwa ReadWriteAcker, tcpRequest *TCPRequest) error {
-	rwa.AckConnection()
+	rwa.AckConnection("")
 	io.Copy(rwa, rwa)
 	return nil
 }
@@ -500,9 +508,10 @@ func TestServeUDPSession(t *testing.T) {
 	defer udpListener.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	val := udpListener.LocalAddr()
 
 	// Establish QUIC connection with edge
-	edgeQUICSessionChan := make(chan quic.Session)
+	edgeQUICSessionChan := make(chan quic.Connection)
 	go func() {
 		earlyListener, err := quic.Listen(udpListener, testTLSServerConfig, testQUICConfig)
 		require.NoError(t, err)
@@ -512,7 +521,8 @@ func TestServeUDPSession(t *testing.T) {
 		edgeQUICSessionChan <- edgeQUICSession
 	}()
 
-	qc := testQUICConnection(udpListener.LocalAddr(), t)
+	// Random index to avoid reusing port
+	qc := testQUICConnection(val, t, 28)
 	go qc.Serve(ctx)
 
 	edgeQUICSession := <-edgeQUICSessionChan
@@ -522,7 +532,76 @@ func TestServeUDPSession(t *testing.T) {
 	cancel()
 }
 
-func serveSession(ctx context.Context, qc *QUICConnection, edgeQUICSession quic.Session, closeType closeReason, expectedReason string, t *testing.T) {
+func TestNopCloserReadWriterCloseBeforeEOF(t *testing.T) {
+	readerWriter := nopCloserReadWriter{ReadWriteCloser: &mockReaderNoopWriter{Reader: strings.NewReader("123456789")}}
+	buffer := make([]byte, 5)
+
+	n, err := readerWriter.Read(buffer)
+	require.NoError(t, err)
+	require.Equal(t, n, 5)
+
+	// close
+	require.NoError(t, readerWriter.Close())
+
+	// read should get error
+	n, err = readerWriter.Read(buffer)
+	require.Equal(t, n, 0)
+	require.Equal(t, err, fmt.Errorf("closed by handler"))
+}
+
+func TestNopCloserReadWriterCloseAfterEOF(t *testing.T) {
+	readerWriter := nopCloserReadWriter{ReadWriteCloser: &mockReaderNoopWriter{Reader: strings.NewReader("123456789")}}
+	buffer := make([]byte, 20)
+
+	n, err := readerWriter.Read(buffer)
+	require.NoError(t, err)
+	require.Equal(t, n, 9)
+
+	// force another read to read eof
+	_, err = readerWriter.Read(buffer)
+	require.Equal(t, err, io.EOF)
+
+	// close
+	require.NoError(t, readerWriter.Close())
+
+	// read should get EOF still
+	n, err = readerWriter.Read(buffer)
+	require.Equal(t, n, 0)
+	require.Equal(t, err, io.EOF)
+}
+
+func TestCreateUDPConnReuseSourcePort(t *testing.T) {
+	logger := zerolog.Nop()
+	conn, err := createUDPConnForConnIndex(0, nil, &logger)
+	require.NoError(t, err)
+
+	getPortFunc := func(conn *net.UDPConn) int {
+		addr := conn.LocalAddr().(*net.UDPAddr)
+		return addr.Port
+	}
+
+	initialPort := getPortFunc(conn)
+
+	// close conn
+	conn.Close()
+
+	// should get the same port as before.
+	conn, err = createUDPConnForConnIndex(0, nil, &logger)
+	require.NoError(t, err)
+	require.Equal(t, initialPort, getPortFunc(conn))
+
+	// new index, should get a different port
+	conn1, err := createUDPConnForConnIndex(1, nil, &logger)
+	require.NoError(t, err)
+	require.NotEqual(t, initialPort, getPortFunc(conn1))
+
+	// not closing the conn and trying to obtain a new conn for same index should give a different random port
+	conn, err = createUDPConnForConnIndex(0, nil, &logger)
+	require.NoError(t, err)
+	require.NotEqual(t, initialPort, getPortFunc(conn))
+}
+
+func serveSession(ctx context.Context, qc *QUICConnection, edgeQUICSession quic.Connection, closeType closeReason, expectedReason string, t *testing.T) {
 	var (
 		payload = []byte(t.Name())
 	)
@@ -538,8 +617,12 @@ func serveSession(ctx context.Context, qc *QUICConnection, edgeQUICSession quic.
 		close(sessionDone)
 	}()
 
-	// Send a message to the quic session on edge side, it should be deumx to this datagram session
-	muxedPayload := append(payload, sessionID[:]...)
+	// Send a message to the quic session on edge side, it should be deumx to this datagram v2 session
+	muxedPayload, err := quicpogs.SuffixSessionID(sessionID, payload)
+	require.NoError(t, err)
+	muxedPayload, err = quicpogs.SuffixType(muxedPayload, quicpogs.DatagramTypeUDP)
+	require.NoError(t, err)
+
 	err = edgeQUICSession.SendMessage(muxedPayload)
 	require.NoError(t, err)
 
@@ -583,7 +666,7 @@ const (
 	closedByTimeout
 )
 
-func runRPCServer(ctx context.Context, session quic.Session, sessionRPCServer tunnelpogs.SessionManager, configRPCServer tunnelpogs.ConfigurationManager, t *testing.T) {
+func runRPCServer(ctx context.Context, session quic.Connection, sessionRPCServer tunnelpogs.SessionManager, configRPCServer tunnelpogs.ConfigurationManager, t *testing.T) {
 	stream, err := session.AcceptStream(ctx)
 	require.NoError(t, err)
 
@@ -608,8 +691,8 @@ type mockSessionRPCServer struct {
 	calledUnregisterChan chan struct{}
 }
 
-func (s mockSessionRPCServer) RegisterUdpSession(ctx context.Context, sessionID uuid.UUID, dstIP net.IP, dstPort uint16, closeIdleAfter time.Duration) error {
-	return fmt.Errorf("mockSessionRPCServer doesn't implement RegisterUdpSession")
+func (s mockSessionRPCServer) RegisterUdpSession(ctx context.Context, sessionID uuid.UUID, dstIP net.IP, dstPort uint16, closeIdleAfter time.Duration, traceContext string) (*pogs.RegisterUdpSessionResponse, error) {
+	return nil, fmt.Errorf("mockSessionRPCServer doesn't implement RegisterUdpSession")
 }
 
 func (s mockSessionRPCServer) UnregisterUdpSession(ctx context.Context, sessionID uuid.UUID, reason string) error {
@@ -623,7 +706,7 @@ func (s mockSessionRPCServer) UnregisterUdpSession(ctx context.Context, sessionI
 	return nil
 }
 
-func testQUICConnection(udpListenerAddr net.Addr, t *testing.T) *QUICConnection {
+func testQUICConnection(udpListenerAddr net.Addr, t *testing.T, index uint8) *QUICConnection {
 	tlsClientConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"argotunnel"},
@@ -633,12 +716,27 @@ func testQUICConnection(udpListenerAddr net.Addr, t *testing.T) *QUICConnection 
 	qc, err := NewQUICConnection(
 		testQUICConfig,
 		udpListenerAddr,
+		nil,
+		index,
 		tlsClientConfig,
 		&mockOrchestrator{originProxy: &mockOriginProxyWithRequest{}},
 		&tunnelpogs.ConnectionOptions{},
 		fakeControlStream{},
 		&log,
+		nil,
 	)
 	require.NoError(t, err)
 	return qc
+}
+
+type mockReaderNoopWriter struct {
+	io.Reader
+}
+
+func (m *mockReaderNoopWriter) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+
+func (m *mockReaderNoopWriter) Close() error {
+	return nil
 }
