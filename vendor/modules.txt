@@ -144,8 +144,8 @@ github.com/go-logr/stdr
 # github.com/go-task/slim-sprig v0.0.0-20210107165309-348f09dbbbc0
 ## explicit; go 1.13
 github.com/go-task/slim-sprig
-# github.com/gobwas/httphead v0.0.0-20200921212729-da3d93bc3c58
-## explicit
+# github.com/gobwas/httphead v0.1.0
+## explicit; go 1.15
 github.com/gobwas/httphead
 # github.com/gobwas/pool v0.2.1
 ## explicit
@@ -153,8 +153,8 @@ github.com/gobwas/pool
 github.com/gobwas/pool/internal/pmath
 github.com/gobwas/pool/pbufio
 github.com/gobwas/pool/pbytes
-# github.com/gobwas/ws v1.0.4
-## explicit
+# github.com/gobwas/ws v1.2.1
+## explicit; go 1.15
 github.com/gobwas/ws
 github.com/gobwas/ws/wsutil
 # github.com/golang-collections/collections v0.0.0-20130729185459-604e922904d3
