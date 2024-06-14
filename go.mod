@@ -18,7 +18,7 @@ require (
 	github.com/golang-collections/collections v0.0.0-20130729185459-604e922904d3
 	github.com/google/gopacket v1.1.19
 	github.com/google/uuid v1.3.0
-	github.com/gorilla/websocket v1.4.2
+	github.com/gorilla/websocket v1.5.3
 	github.com/json-iterator/go v1.1.12
 	github.com/lucas-clemente/quic-go v0.28.1
 	github.com/mattn/go-colorable v0.1.13
