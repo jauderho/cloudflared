@@ -7,7 +7,6 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/google/gopacket/layers"
 	"github.com/stretchr/testify/require"
@@ -20,18 +19,17 @@ import (
 )
 
 var (
-	packetConfig = &GlobalRouterConfig{
-		ICMPRouter: nil,
-		IPv4Src:    netip.MustParseAddr("172.16.0.1"),
-		IPv6Src:    netip.MustParseAddr("fd51:2391:523:f4ee::1"),
+	defaultRouter = &icmpRouter{
+		ipv4Proxy: nil,
+		ipv4Src:   netip.MustParseAddr("172.16.0.1"),
+		ipv6Proxy: nil,
+		ipv6Src:   netip.MustParseAddr("fd51:2391:523:f4ee::1"),
 	}
 )
 
 func TestRouterReturnTTLExceed(t *testing.T) {
 	muxer := newMockMuxer(0)
-	routerEnabled := &routerEnabledChecker{}
-	routerEnabled.set(true)
-	router := NewPacketRouter(packetConfig, muxer, &noopLogger, routerEnabled.isEnabled)
+	router := NewPacketRouter(defaultRouter, muxer, 0, &noopLogger)
 	ctx, cancel := context.WithCancel(context.Background())
 	routerStopped := make(chan struct{})
 	go func() {
@@ -56,7 +54,7 @@ func TestRouterReturnTTLExceed(t *testing.T) {
 			},
 		},
 	}
-	assertTTLExceed(t, &pk, router.globalConfig.IPv4Src, muxer)
+	assertTTLExceed(t, &pk, defaultRouter.ipv4Src, muxer)
 	pk = packet.ICMP{
 		IP: &packet.IP{
 			Src:      netip.MustParseAddr("fd51:2391:523:f4ee::1"),
@@ -74,66 +72,7 @@ func TestRouterReturnTTLExceed(t *testing.T) {
 			},
 		},
 	}
-	assertTTLExceed(t, &pk, router.globalConfig.IPv6Src, muxer)
-
-	cancel()
-	<-routerStopped
-}
-
-func TestRouterCheckEnabled(t *testing.T) {
-	muxer := newMockMuxer(0)
-	routerEnabled := &routerEnabledChecker{}
-	router := NewPacketRouter(packetConfig, muxer, &noopLogger, routerEnabled.isEnabled)
-	ctx, cancel := context.WithCancel(context.Background())
-	routerStopped := make(chan struct{})
-	go func() {
-		router.Serve(ctx)
-		close(routerStopped)
-	}()
-
-	pk := packet.ICMP{
-		IP: &packet.IP{
-			Src:      netip.MustParseAddr("192.168.1.1"),
-			Dst:      netip.MustParseAddr("10.0.0.1"),
-			Protocol: layers.IPProtocolICMPv4,
-			TTL:      1,
-		},
-		Message: &icmp.Message{
-			Type: ipv4.ICMPTypeEcho,
-			Code: 0,
-			Body: &icmp.Echo{
-				ID:   12481,
-				Seq:  8036,
-				Data: []byte(t.Name()),
-			},
-		},
-	}
-
-	// router is disabled
-	encoder := packet.NewEncoder()
-	encodedPacket, err := encoder.Encode(&pk)
-	require.NoError(t, err)
-	sendPacket := quicpogs.RawPacket(encodedPacket)
-
-	muxer.edgeToCfd <- sendPacket
-	select {
-	case <-time.After(time.Millisecond * 10):
-	case <-muxer.cfdToEdge:
-		t.Error("Unexpected reply when router is disabled")
-	}
-	routerEnabled.set(true)
-	// router is enabled, expects reply
-	muxer.edgeToCfd <- sendPacket
-	<-muxer.cfdToEdge
-
-	routerEnabled.set(false)
-	// router is disabled
-	muxer.edgeToCfd <- sendPacket
-	select {
-	case <-time.After(time.Millisecond * 10):
-	case <-muxer.cfdToEdge:
-		t.Error("Unexpected reply when router is disabled")
-	}
+	assertTTLExceed(t, &pk, defaultRouter.ipv6Src, muxer)
 
 	cancel()
 	<-routerStopped

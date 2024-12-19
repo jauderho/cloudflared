@@ -40,8 +40,6 @@ type HTTP2Connection struct {
 	connOptions  *tunnelpogs.ConnectionOptions
 	observer     *Observer
 	connIndex    uint8
-	// newRPCClientFunc allows us to mock RPCs during testing
-	newRPCClientFunc func(context.Context, io.ReadWriteCloser, *zerolog.Logger) NamedTunnelRPCClient
 
 	log                  *zerolog.Logger
 	activeRequestsWG     sync.WaitGroup
@@ -69,7 +67,6 @@ func NewHTTP2Connection(
 		connOptions:          connOptions,
 		observer:             observer,
 		connIndex:            connIndex,
-		newRPCClientFunc:     newRegistrationRPCClient,
 		controlStreamHandler: controlStreamHandler,
 		log:                  log,
 	}
@@ -142,7 +139,7 @@ func (c *HTTP2Connection) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		rws := NewHTTPResponseReadWriterAcker(respWriter, r)
+		rws := NewHTTPResponseReadWriterAcker(respWriter, respWriter, r)
 		requestErr = originProxy.ProxyTCP(r.Context(), rws, &TCPRequest{
 			Dest:      host,
 			CFRay:     FindCfRayHeader(r),
@@ -289,6 +286,10 @@ func (rp *http2RespWriter) Header() http.Header {
 	return rp.respHeaders
 }
 
+func (rp *http2RespWriter) Flush() {
+	rp.flusher.Flush()
+}
+
 func (rp *http2RespWriter) WriteHeader(status int) {
 	if rp.hijacked() {
 		rp.log.Warn().Msg("WriteHeader after hijack")
@@ -384,8 +385,7 @@ func determineHTTP2Type(r *http.Request) Type {
 func handleMissingRequestParts(connType Type, r *http.Request) {
 	if connType == TypeHTTP {
 		// http library has no guarantees that we receive a filled URL. If not, then we fill it, as we reuse the request
-		// for proxying. We use the same values as we used to in h2mux. For proxying they should not matter since we
-		// control the dialer on every egress proxied.
+		// for proxying. For proxying they should not matter since we control the dialer on every egress proxied.
 		if len(r.URL.Scheme) == 0 {
 			r.URL.Scheme = "http"
 		}

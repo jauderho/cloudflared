@@ -51,13 +51,13 @@ type Session struct {
 
 func (s *Session) Serve(ctx context.Context, closeAfterIdle time.Duration) (closedByRemote bool, err error) {
 	go func() {
-		// QUIC implementation copies data to another buffer before returning https://github.com/lucas-clemente/quic-go/blob/v0.24.0/session.go#L1967-L1975
+		// QUIC implementation copies data to another buffer before returning https://github.com/quic-go/quic-go/blob/v0.24.0/session.go#L1967-L1975
 		// This makes it safe to share readBuffer between iterations
 		const maxPacketSize = 1500
 		readBuffer := make([]byte, maxPacketSize)
 		for {
 			if closeSession, err := s.dstToTransport(readBuffer); err != nil {
-				if errors.Is(err, net.ErrClosed) {
+				if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 					s.log.Debug().Msg("Destination connection closed")
 				} else {
 					level := zerolog.ErrorLevel

@@ -28,10 +28,8 @@ type icmpProxy struct {
 	srcFunnelTracker *packet.FunnelTracker
 	echoIDTracker    *echoIDTracker
 	conn             *icmp.PacketConn
-	// Response is handled in one-by-one, so encoder can be shared between funnels
-	encoder     *packet.Encoder
-	logger      *zerolog.Logger
-	idleTimeout time.Duration
+	logger           *zerolog.Logger
+	idleTimeout      time.Duration
 }
 
 // echoIDTracker tracks which ID has been assigned. It first loops through assignment from lastAssignment to then end,
@@ -114,8 +112,8 @@ func (snf echoFunnelID) String() string {
 	return strconv.FormatUint(uint64(snf), 10)
 }
 
-func newICMPProxy(listenIP netip.Addr, zone string, logger *zerolog.Logger, idleTimeout time.Duration) (*icmpProxy, error) {
-	conn, err := newICMPConn(listenIP, zone)
+func newICMPProxy(listenIP netip.Addr, logger *zerolog.Logger, idleTimeout time.Duration) (*icmpProxy, error) {
+	conn, err := newICMPConn(listenIP)
 	if err != nil {
 		return nil, err
 	}
@@ -123,26 +121,23 @@ func newICMPProxy(listenIP netip.Addr, zone string, logger *zerolog.Logger, idle
 	return &icmpProxy{
 		srcFunnelTracker: packet.NewFunnelTracker(),
 		echoIDTracker:    newEchoIDTracker(),
-		encoder:          packet.NewEncoder(),
 		conn:             conn,
 		logger:           logger,
 		idleTimeout:      idleTimeout,
 	}, nil
 }
 
-func (ip *icmpProxy) Request(ctx context.Context, pk *packet.ICMP, responder *packetResponder) error {
-	ctx, span := responder.requestSpan(ctx, pk)
-	defer responder.exportSpan()
+func (ip *icmpProxy) Request(ctx context.Context, pk *packet.ICMP, responder ICMPResponder) error {
+	_, span := responder.RequestSpan(ctx, pk)
+	defer responder.ExportSpan()
 
 	originalEcho, err := getICMPEcho(pk.Message)
 	if err != nil {
 		tracing.EndWithErrorStatus(span, err)
 		return err
 	}
-	span.SetAttributes(
-		attribute.Int("originalEchoID", originalEcho.ID),
-		attribute.Int("seq", originalEcho.Seq),
-	)
+	observeICMPRequest(ip.logger, span, pk.Src.String(), pk.Dst.String(), originalEcho.ID, originalEcho.Seq)
+
 	echoIDTrackerKey := flow3Tuple{
 		srcIP:          pk.Src,
 		dstIP:          pk.Dst,
@@ -156,7 +151,7 @@ func (ip *icmpProxy) Request(ctx context.Context, pk *packet.ICMP, responder *pa
 	}
 	span.SetAttributes(attribute.Int("assignedEchoID", int(assignedEchoID)))
 
-	shouldReplaceFunnelFunc := createShouldReplaceFunnelFunc(ip.logger, responder.datagramMuxer, pk, originalEcho.ID)
+	shouldReplaceFunnelFunc := createShouldReplaceFunnelFunc(ip.logger, responder, pk, originalEcho.ID)
 	newFunnelFunc := func() (packet.Funnel, error) {
 		originalEcho, err := getICMPEcho(pk.Message)
 		if err != nil {
@@ -166,7 +161,7 @@ func (ip *icmpProxy) Request(ctx context.Context, pk *packet.ICMP, responder *pa
 			ip.echoIDTracker.release(echoIDTrackerKey, assignedEchoID)
 			return nil
 		}
-		icmpFlow := newICMPEchoFlow(pk.Src, closeCallback, ip.conn, responder, int(assignedEchoID), originalEcho.ID, ip.encoder)
+		icmpFlow := newICMPEchoFlow(pk.Src, closeCallback, ip.conn, responder, int(assignedEchoID), originalEcho.ID)
 		return icmpFlow, nil
 	}
 	funnelID := echoFunnelID(assignedEchoID)
@@ -189,6 +184,7 @@ func (ip *icmpProxy) Request(ctx context.Context, pk *packet.ICMP, responder *pa
 		tracing.EndWithErrorStatus(span, err)
 		return err
 	}
+
 	err = icmpFlow.sendToDst(pk.Dst, pk.Message)
 	if err != nil {
 		tracing.EndWithErrorStatus(span, err)
@@ -266,18 +262,15 @@ func (ip *icmpProxy) sendReply(ctx context.Context, reply *echoReply) error {
 		return err
 	}
 
-	_, span := icmpFlow.responder.replySpan(ctx, ip.logger)
-	defer icmpFlow.responder.exportSpan()
+	_, span := icmpFlow.responder.ReplySpan(ctx, ip.logger)
+	defer icmpFlow.responder.ExportSpan()
 
-	span.SetAttributes(
-		attribute.String("dst", reply.from.String()),
-		attribute.Int("echoID", reply.echo.ID),
-		attribute.Int("seq", reply.echo.Seq),
-		attribute.Int("originalEchoID", icmpFlow.originalEchoID),
-	)
 	if err := icmpFlow.returnToSrc(reply); err != nil {
 		tracing.EndWithErrorStatus(span, err)
+		return err
 	}
+	observeICMPReply(ip.logger, span, reply.from.String(), reply.echo.ID, reply.echo.Seq)
+	span.SetAttributes(attribute.Int("originalEchoID", icmpFlow.originalEchoID))
 	tracing.End(span)
 	return nil
 }

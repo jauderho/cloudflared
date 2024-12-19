@@ -13,7 +13,6 @@ import base64
 import logging
 import os
 import shutil
-from hashlib import sha256
 from pathlib import Path
 from subprocess import Popen, PIPE
 
@@ -35,7 +34,6 @@ class PkgUploader:
 
     def upload_pkg_to_r2(self, filename, upload_file_path):
         endpoint_url = f"https://{self.account_id}.r2.cloudflarestorage.com"
-        token_secret_hash = sha256(self.client_secret.encode()).hexdigest()
 
         config = Config(
             region_name='auto',
@@ -48,7 +46,7 @@ class PkgUploader:
             "s3",
             endpoint_url=endpoint_url,
             aws_access_key_id=self.client_id,
-            aws_secret_access_key=token_secret_hash,
+            aws_secret_access_key=self.client_secret,
             config=config,
         )
 
@@ -115,7 +113,7 @@ class PkgCreator:
 
     def create_rpm_pkgs(self, artifacts_path, gpg_key_name):
         self._setup_rpm_pkg_directories(artifacts_path, gpg_key_name)
-        p = Popen(["createrepo", "./rpm"], stdout=PIPE, stderr=PIPE)
+        p = Popen(["createrepo_c", "./rpm"], stdout=PIPE, stderr=PIPE)
         out, err = p.communicate()
         if p.returncode != 0:
             print(f"create rpm_pkgs result => {out}, {err}")

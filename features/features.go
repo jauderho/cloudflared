@@ -8,6 +8,7 @@ const (
 	FeaturePostQuantum       = "postquantum"
 	FeatureQUICSupportEOF    = "support_quic_eof"
 	FeatureManagementLogs    = "management_logs"
+	FeatureDatagramV3        = "support_datagram_v3"
 )
 
 var (
@@ -27,4 +28,23 @@ func Contains(feature string) bool {
 		}
 	}
 	return false
+}
+
+// Remove any duplicates from the slice
+func Dedup(slice []string) []string {
+
+	// Convert the slice into a set
+	set := make(map[string]bool, 0)
+	for _, str := range slice {
+		set[str] = true
+	}
+
+	// Convert the set back into a slice
+	keys := make([]string, len(set))
+	i := 0
+	for str := range set {
+		keys[i] = str
+		i++
+	}
+	return keys
 }

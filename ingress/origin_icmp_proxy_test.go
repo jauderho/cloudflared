@@ -9,7 +9,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/fortytw2/leaktest"
 	"github.com/google/gopacket/layers"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -23,9 +25,10 @@ import (
 )
 
 var (
-	noopLogger    = zerolog.Nop()
-	localhostIP   = netip.MustParseAddr("127.0.0.1")
-	localhostIPv6 = netip.MustParseAddr("::1")
+	noopLogger            = zerolog.Nop()
+	localhostIP           = netip.MustParseAddr("127.0.0.1")
+	localhostIPv6         = netip.MustParseAddr("::1")
+	testFunnelIdleTimeout = time.Millisecond * 10
 )
 
 // TestICMPProxyEcho makes sure we can send ICMP echo via the Request method and receives response via the
@@ -40,12 +43,14 @@ func TestICMPRouterEcho(t *testing.T) {
 }
 
 func testICMPRouterEcho(t *testing.T, sendIPv4 bool) {
+	defer leaktest.Check(t)()
+
 	const (
 		echoID = 36571
 		endSeq = 20
 	)
 
-	router, err := NewICMPRouter(localhostIP, localhostIPv6, "", &noopLogger)
+	router, err := NewICMPRouter(localhostIP, localhostIPv6, &noopLogger, testFunnelIdleTimeout)
 	require.NoError(t, err)
 
 	proxyDone := make(chan struct{})
@@ -56,9 +61,7 @@ func testICMPRouterEcho(t *testing.T, sendIPv4 bool) {
 	}()
 
 	muxer := newMockMuxer(1)
-	responder := packetResponder{
-		datagramMuxer: muxer,
-	}
+	responder := newPacketResponder(muxer, 0, packet.NewEncoder())
 
 	protocol := layers.IPProtocolICMPv6
 	if sendIPv4 {
@@ -93,18 +96,23 @@ func testICMPRouterEcho(t *testing.T, sendIPv4 bool) {
 					},
 				},
 			}
-			require.NoError(t, router.Request(ctx, &pk, &responder))
+			require.NoError(t, router.Request(ctx, &pk, responder))
 			validateEchoFlow(t, <-muxer.cfdToEdge, &pk)
 		}
 	}
+
+	// Make sure funnel cleanup kicks in
+	time.Sleep(testFunnelIdleTimeout * 2)
 	cancel()
 	<-proxyDone
 }
 
 func TestTraceICMPRouterEcho(t *testing.T) {
+	defer leaktest.Check(t)()
+
 	tracingCtx := "ec31ad8a01fde11fdcabe2efdce36873:52726f6cabc144f5:0:1"
 
-	router, err := NewICMPRouter(localhostIP, localhostIPv6, "", &noopLogger)
+	router, err := NewICMPRouter(localhostIP, localhostIPv6, &noopLogger, testFunnelIdleTimeout)
 	require.NoError(t, err)
 
 	proxyDone := make(chan struct{})
@@ -121,11 +129,8 @@ func TestTraceICMPRouterEcho(t *testing.T) {
 	serializedIdentity, err := tracingIdentity.MarshalBinary()
 	require.NoError(t, err)
 
-	responder := packetResponder{
-		datagramMuxer:      muxer,
-		tracedCtx:          tracing.NewTracedContext(ctx, tracingIdentity.String(), &noopLogger),
-		serializedIdentity: serializedIdentity,
-	}
+	responder := newPacketResponder(muxer, 0, packet.NewEncoder())
+	responder.AddTraceContext(tracing.NewTracedContext(ctx, tracingIdentity.String(), &noopLogger), serializedIdentity)
 
 	echo := &icmp.Echo{
 		ID:   12910,
@@ -146,7 +151,7 @@ func TestTraceICMPRouterEcho(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, router.Request(ctx, &pk, &responder))
+	require.NoError(t, router.Request(ctx, &pk, responder))
 	firstPK := <-muxer.cfdToEdge
 	var requestSpan *quicpogs.TracingSpanPacket
 	// The order of receiving reply or request span is not deterministic
@@ -184,10 +189,8 @@ func TestTraceICMPRouterEcho(t *testing.T) {
 	echo.Seq++
 	pk.Body = echo
 	// Only first request for a flow is traced. The edge will not send tracing context for the second request
-	newResponder := packetResponder{
-		datagramMuxer: muxer,
-	}
-	require.NoError(t, router.Request(ctx, &pk, &newResponder))
+	newResponder := newPacketResponder(muxer, 0, packet.NewEncoder())
+	require.NoError(t, router.Request(ctx, &pk, newResponder))
 	validateEchoFlow(t, <-muxer.cfdToEdge, &pk)
 
 	select {
@@ -196,6 +199,7 @@ func TestTraceICMPRouterEcho(t *testing.T) {
 	default:
 	}
 
+	time.Sleep(testFunnelIdleTimeout * 2)
 	cancel()
 	<-proxyDone
 }
@@ -203,12 +207,14 @@ func TestTraceICMPRouterEcho(t *testing.T) {
 // TestConcurrentRequests makes sure icmpRouter can send concurrent requests to the same destination with different
 // echo ID. This simulates concurrent ping to the same destination.
 func TestConcurrentRequestsToSameDst(t *testing.T) {
+	defer leaktest.Check(t)()
+
 	const (
 		concurrentPings = 5
 		endSeq          = 5
 	)
 
-	router, err := NewICMPRouter(localhostIP, localhostIPv6, "", &noopLogger)
+	router, err := NewICMPRouter(localhostIP, localhostIPv6, &noopLogger, testFunnelIdleTimeout)
 	require.NoError(t, err)
 
 	proxyDone := make(chan struct{})
@@ -227,9 +233,7 @@ func TestConcurrentRequestsToSameDst(t *testing.T) {
 			defer wg.Done()
 
 			muxer := newMockMuxer(1)
-			responder := packetResponder{
-				datagramMuxer: muxer,
-			}
+			responder := newPacketResponder(muxer, 0, packet.NewEncoder())
 			for seq := 0; seq < endSeq; seq++ {
 				pk := &packet.ICMP{
 					IP: &packet.IP{
@@ -248,16 +252,14 @@ func TestConcurrentRequestsToSameDst(t *testing.T) {
 						},
 					},
 				}
-				require.NoError(t, router.Request(ctx, pk, &responder))
+				require.NoError(t, router.Request(ctx, pk, responder))
 				validateEchoFlow(t, <-muxer.cfdToEdge, pk)
 			}
 		}()
 		go func() {
 			defer wg.Done()
 			muxer := newMockMuxer(1)
-			responder := packetResponder{
-				datagramMuxer: muxer,
-			}
+			responder := newPacketResponder(muxer, 0, packet.NewEncoder())
 			for seq := 0; seq < endSeq; seq++ {
 				pk := &packet.ICMP{
 					IP: &packet.IP{
@@ -276,18 +278,22 @@ func TestConcurrentRequestsToSameDst(t *testing.T) {
 						},
 					},
 				}
-				require.NoError(t, router.Request(ctx, pk, &responder))
+				require.NoError(t, router.Request(ctx, pk, responder))
 				validateEchoFlow(t, <-muxer.cfdToEdge, pk)
 			}
 		}()
 	}
 	wg.Wait()
+
+	time.Sleep(testFunnelIdleTimeout * 2)
 	cancel()
 	<-proxyDone
 }
 
 // TestICMPProxyRejectNotEcho makes sure it rejects messages other than echo
 func TestICMPRouterRejectNotEcho(t *testing.T) {
+	defer leaktest.Check(t)()
+
 	msgs := []icmp.Message{
 		{
 			Type: ipv4.ICMPTypeDestinationUnreachable,
@@ -341,13 +347,11 @@ func TestICMPRouterRejectNotEcho(t *testing.T) {
 }
 
 func testICMPRouterRejectNotEcho(t *testing.T, srcDstIP netip.Addr, msgs []icmp.Message) {
-	router, err := NewICMPRouter(localhostIP, localhostIPv6, "", &noopLogger)
+	router, err := NewICMPRouter(localhostIP, localhostIPv6, &noopLogger, testFunnelIdleTimeout)
 	require.NoError(t, err)
 
 	muxer := newMockMuxer(1)
-	responder := packetResponder{
-		datagramMuxer: muxer,
-	}
+	responder := newPacketResponder(muxer, 0, packet.NewEncoder())
 	protocol := layers.IPProtocolICMPv4
 	if srcDstIP.Is6() {
 		protocol = layers.IPProtocolICMPv6
@@ -362,7 +366,7 @@ func testICMPRouterRejectNotEcho(t *testing.T, srcDstIP netip.Addr, msgs []icmp.
 			},
 			Message: &m,
 		}
-		require.Error(t, router.Request(context.Background(), &pk, &responder))
+		require.Error(t, router.Request(context.Background(), &pk, responder))
 	}
 }
 
@@ -390,15 +394,16 @@ func getLocalIPs(t *testing.T, ipv4 bool) []netip.Addr {
 	require.NoError(t, err)
 	localIPs := []netip.Addr{}
 	for _, i := range interfaces {
-		// Skip TUN devices
-		if strings.Contains(i.Name, "tun") {
+		// Skip TUN devices, and Docker Networks
+		if strings.Contains(i.Name, "tun") || strings.Contains(i.Name, "docker") || strings.HasPrefix(i.Name, "br-") {
 			continue
 		}
 		addrs, err := i.Addrs()
 		require.NoError(t, err)
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && (ipnet.IP.IsPrivate() || ipnet.IP.IsLoopback()) {
-				if (ipv4 && ipnet.IP.To4() != nil) || (!ipv4 && ipnet.IP.To4() == nil) {
+				// TODO DEVTOOLS-12514: We only run the IPv6 against the loopback interface due to issues on the CI runners.
+				if (ipv4 && ipnet.IP.To4() != nil) || (!ipv4 && ipnet.IP.To4() == nil && ipnet.IP.IsLoopback()) {
 					localIPs = append(localIPs, netip.MustParseAddr(ipnet.IP.String()))
 				}
 			}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fortytw2/leaktest"
 	"github.com/google/gopacket/layers"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -18,13 +19,15 @@ import (
 )
 
 func TestFunnelIdleTimeout(t *testing.T) {
+	defer leaktest.Check(t)()
+
 	const (
 		idleTimeout = time.Second
 		echoID      = 42573
 		startSeq    = 8129
 	)
 	logger := zerolog.New(os.Stderr)
-	proxy, err := newICMPProxy(localhostIP, "", &logger, idleTimeout)
+	proxy, err := newICMPProxy(localhostIP, &logger, idleTimeout)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,38 +56,36 @@ func TestFunnelIdleTimeout(t *testing.T) {
 		},
 	}
 	muxer := newMockMuxer(0)
-	responder := packetResponder{
-		datagramMuxer: muxer,
-	}
-	require.NoError(t, proxy.Request(ctx, &pk, &responder))
+	responder := newPacketResponder(muxer, 0, packet.NewEncoder())
+	require.NoError(t, proxy.Request(ctx, &pk, responder))
 	validateEchoFlow(t, <-muxer.cfdToEdge, &pk)
 
 	// Send second request, should reuse the funnel
-	require.NoError(t, proxy.Request(ctx, &pk, &packetResponder{
-		datagramMuxer: muxer,
-	}))
+	require.NoError(t, proxy.Request(ctx, &pk, responder))
 	validateEchoFlow(t, <-muxer.cfdToEdge, &pk)
 
+	// New muxer on a different connection should use a new flow
 	time.Sleep(idleTimeout * 2)
 	newMuxer := newMockMuxer(0)
-	newResponder := packetResponder{
-		datagramMuxer: newMuxer,
-	}
-	require.NoError(t, proxy.Request(ctx, &pk, &newResponder))
+	newResponder := newPacketResponder(newMuxer, 1, packet.NewEncoder())
+	require.NoError(t, proxy.Request(ctx, &pk, newResponder))
 	validateEchoFlow(t, <-newMuxer.cfdToEdge, &pk)
 
+	time.Sleep(idleTimeout * 2)
 	cancel()
 	<-proxyDone
 }
 
 func TestReuseFunnel(t *testing.T) {
+	defer leaktest.Check(t)()
+
 	const (
-		idleTimeout = time.Second
+		idleTimeout = time.Millisecond * 100
 		echoID      = 42573
 		startSeq    = 8129
 	)
 	logger := zerolog.New(os.Stderr)
-	proxy, err := newICMPProxy(localhostIP, "", &logger, idleTimeout)
+	proxy, err := newICMPProxy(localhostIP, &logger, idleTimeout)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -118,22 +119,20 @@ func TestReuseFunnel(t *testing.T) {
 		originalEchoID: echoID,
 	}
 	muxer := newMockMuxer(0)
-	responder := packetResponder{
-		datagramMuxer: muxer,
-	}
-	require.NoError(t, proxy.Request(ctx, &pk, &responder))
+	responder := newPacketResponder(muxer, 0, packet.NewEncoder())
+	require.NoError(t, proxy.Request(ctx, &pk, responder))
 	validateEchoFlow(t, <-muxer.cfdToEdge, &pk)
 	funnel1, found := getFunnel(t, proxy, tuple)
 	require.True(t, found)
 
 	// Send second request, should reuse the funnel
-	require.NoError(t, proxy.Request(ctx, &pk, &packetResponder{
-		datagramMuxer: muxer,
-	}))
+	require.NoError(t, proxy.Request(ctx, &pk, responder))
 	validateEchoFlow(t, <-muxer.cfdToEdge, &pk)
 	funnel2, found := getFunnel(t, proxy, tuple)
 	require.True(t, found)
 	require.Equal(t, funnel1, funnel2)
+
+	time.Sleep(idleTimeout * 2)
 
 	cancel()
 	<-proxyDone
